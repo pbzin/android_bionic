@@ -26,6 +26,8 @@ struct statx;
 
 __BEGIN_DECLS
 
+void custom_rom_hide_set_enabled(bool enabled);
+bool custom_rom_hide_is_enabled();
 bool custom_rom_hide_is_app_process();
 
 bool custom_rom_hide_should_block(const char* path);

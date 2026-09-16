@@ -92,6 +92,15 @@ static const PartitionDevEntry kPartitionDmMap[] = {
 };
 
 static _Atomic(uint64_t) g_substituted_fd_bits[HIDE_TRACKED_FD_WORD_COUNT];
+static _Atomic(bool) g_custom_rom_hide_enabled = false;
+
+void custom_rom_hide_set_enabled(bool enabled) {
+    atomic_store_explicit(&g_custom_rom_hide_enabled, enabled, memory_order_release);
+}
+
+bool custom_rom_hide_is_enabled() {
+    return atomic_load_explicit(&g_custom_rom_hide_enabled, memory_order_acquire);
+}
 
 static bool is_trackable_fd(int fd) {
     return fd >= 0 && fd < HIDE_TRACKED_FD_LIMIT;
@@ -193,7 +202,18 @@ static bool compute_allowlisted() {
 }
 
 static bool compute_app_process() {
+    if (!custom_rom_hide_is_enabled()) return false;
     if ((getuid() % AID_USER_OFFSET) < AID_APP_START) return false;
+
+    // crash_dump runs with the crashing app's UID. Treating it as an app
+    // replaces /proc/<pid>/maps with a memfd and prevents debuggerd from
+    // producing a tombstone under SELinux.
+    const char* progname = getprogname();
+    if (progname && (strcmp(progname, "crash_dump32") == 0 ||
+                     strcmp(progname, "crash_dump64") == 0)) {
+        return false;
+    }
+
     if (compute_allowlisted()) return false;
     return true;
 }
@@ -390,12 +410,26 @@ ssize_t custom_rom_hide_readlink_post(char* buf, size_t size, ssize_t ret) {
 enum ProcFilterType {
     PROC_FILTER_NONE, PROC_FILTER_MAPS, PROC_FILTER_MOUNTS,
     PROC_FILTER_MOUNTINFO, PROC_FILTER_FILESYSTEMS, PROC_FILTER_CMDLINE,
+    PROC_FILTER_STATUS,
 };
+
+static bool is_own_proc_status(const char* path) {
+    if (strcmp(path, "/proc/self/status") == 0 ||
+        strcmp(path, "/proc/thread-self/status") == 0) {
+        return true;
+    }
+
+    if (strncmp(path, "/proc/", 6) != 0) return false;
+    char* end = nullptr;
+    long pid = strtol(path + 6, &end, 10);
+    return end != path + 6 && strcmp(end, "/status") == 0 && pid == getpid();
+}
 
 static ProcFilterType get_proc_filter_type(const char* path) {
     if (!path || reinterpret_cast<uintptr_t>(path) < 0x1000000) return PROC_FILTER_NONE;
     if (strcmp(path, "/proc/cmdline") == 0) return PROC_FILTER_CMDLINE;
     if (strcmp(path, "/proc/filesystems") == 0) return PROC_FILTER_FILESYSTEMS;
+    if (is_own_proc_status(path)) return PROC_FILTER_STATUS;
     if (strncmp(path, "/proc/", 6) != 0) return PROC_FILTER_NONE;
 
     const char* leaf = nullptr;
@@ -479,6 +513,16 @@ typedef bool (*LinePredicate)(const char* line, void* ctx);
 typedef void (*LineWriter)(int mem_fd, char* line, size_t line_len, void* ctx);
 
 static void write_line_raw(int mem_fd, char* line, size_t line_len, void*) {
+    raw_write(mem_fd, line, line_len);
+}
+
+static void write_status_line(int mem_fd, char* line, size_t line_len, void*) {
+    static constexpr char kTracerPid[] = "TracerPid:";
+    if (strncmp(line, kTracerPid, sizeof(kTracerPid) - 1) == 0) {
+        static constexpr char kHiddenTracer[] = "TracerPid:\t0\n";
+        raw_write(mem_fd, kHiddenTracer, sizeof(kHiddenTracer) - 1);
+        return;
+    }
     raw_write(mem_fd, line, line_len);
 }
 
@@ -598,8 +642,14 @@ int custom_rom_hide_filter_proc(const char* path) {
     if (type == PROC_FILTER_NONE) { errno = saved_errno; return -1; }
 
     if (type != PROC_FILTER_CMDLINE) {
-        LineWriter writer = (type == PROC_FILTER_MOUNTS || type == PROC_FILTER_MOUNTINFO)
-                ? write_spoofed_mount_line : write_line_raw;
+        LineWriter writer;
+        if (type == PROC_FILTER_MOUNTS || type == PROC_FILTER_MOUNTINFO) {
+            writer = write_spoofed_mount_line;
+        } else if (type == PROC_FILTER_STATUS) {
+            writer = write_status_line;
+        } else {
+            writer = write_line_raw;
+        }
         int mem_fd = filter_file_with(path, drop_proc_line, writer, &type);
         errno = saved_errno;
         return mem_fd;
@@ -730,6 +780,7 @@ static const PropOverride kSpoofedValueProps[] = {
     {"ro.build.tags", "release-keys"},
     {"ro.secure", "1"},
     {"ro.adb.secure", "1"},
+    {"init.svc.adbd", "stopped"},
     {nullptr, nullptr}
 };
 
